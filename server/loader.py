@@ -192,6 +192,23 @@ def load_dual_gpu_pipeline(
         except Exception:
             pass
 
+    # LoRA loading (optional). Comma-separated paths via env var.
+    lora_paths_env = os.environ.get("QWEN_EDIT_LORA_PATHS", "").strip()
+    if lora_paths_env:
+        paths = [p.strip() for p in lora_paths_env.split(",") if p.strip()]
+        adapter_names: list[str] = []
+        for p in paths:
+            if not os.path.exists(p):
+                LOG.warning("LoRA file not found, skipping: %s", p)
+                continue
+            name = os.path.splitext(os.path.basename(p))[0]
+            LOG.info("loading LoRA adapter '%s' from %s ...", name, p)
+            pipe.load_lora_weights(p, adapter_name=name)
+            adapter_names.append(name)
+        if adapter_names:
+            pipe.set_adapters(adapter_names, adapter_weights=[1.0] * len(adapter_names))
+            LOG.info("active LoRA adapters: %s", adapter_names)
+
     return pipe, cls_name
 
 

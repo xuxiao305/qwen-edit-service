@@ -42,6 +42,7 @@ MODEL_PATH = os.environ.get(
     "/project/qwen_edit/models/Qwen-Image-Edit-2511",
 )
 PER_GPU_MEM_GIB = int(os.environ.get("QWEN_EDIT_GPU_MEM_GIB", "22"))
+DEFAULT_STEPS = int(os.environ.get("QWEN_EDIT_DEFAULT_STEPS", "40"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LOAD_STRATEGY = "dual_balanced"
 
@@ -91,8 +92,11 @@ class EditRequest(BaseModel):
     image_b64: str = Field(..., description="Base64 PNG/JPEG of input image")
     prompt: str = Field(..., description="Edit instruction in natural language")
     negative_prompt: str = Field(default=" ", description="Negative prompt")
-    num_inference_steps: int = Field(default=40, ge=1, le=100)
+    num_inference_steps: int | None = Field(default=None, ge=1, le=100,
+        description="Inference steps; defaults to QWEN_EDIT_DEFAULT_STEPS env var (40 normal, 4 Lightning)")
     true_cfg_scale: float = Field(default=4.0, ge=0.0, le=20.0)
+    lora_scale: float = Field(default=1.0, ge=0.0, le=2.0,
+        description="LoRA adapter weight; 0.0 disables LoRA effect")
     seed: int | None = Field(default=None)
     width: int | None = Field(default=None)
     height: int | None = Field(default=None)
@@ -111,12 +115,24 @@ def _encode_image_b64(img: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _active_lora_names() -> list[str]:
+    """Return names of currently loaded LoRA adapters (empty list if none)."""
+    if _pipe is None:
+        return []
+    try:
+        adapters = _pipe.get_list_adapters()
+        return list(adapters.keys()) if adapters else []
+    except Exception:
+        return []
+
+
 def _run_edit(
     image: Image.Image,
     prompt: str,
     negative_prompt: str,
     num_inference_steps: int,
     true_cfg_scale: float,
+    lora_scale: float,
     seed: int | None,
     width: int | None,
     height: int | None,
@@ -125,6 +141,14 @@ def _run_edit(
     if seed is None:
         seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
     gen = torch.Generator(device="cuda").manual_seed(seed)
+
+    # Adjust LoRA strength per-request if adapters are loaded.
+    active_loras = _active_lora_names()
+    if active_loras:
+        try:
+            pipe.set_adapters(active_loras, adapter_weights=[lora_scale] * len(active_loras))
+        except Exception as exc:
+            LOG.warning("set_adapters failed (non-fatal): %s", exc)
 
     kwargs: dict[str, Any] = dict(
         image=image,
@@ -146,6 +170,8 @@ def _run_edit(
         "seed": seed,
         "steps": num_inference_steps,
         "true_cfg_scale": true_cfg_scale,
+        "lora_scale": lora_scale,
+        "active_loras": active_loras,
         "elapsed_sec": round(elapsed, 2),
         "pipeline_class": _pipe_class_name,
         "load_strategy": LOAD_STRATEGY,
@@ -163,6 +189,8 @@ def health():
         "device": DEVICE,
         "load_strategy": LOAD_STRATEGY,
         "per_gpu_mem_gib": PER_GPU_MEM_GIB,
+        "default_steps": DEFAULT_STEPS,
+        "active_loras": _active_lora_names(),
     }
     if torch.cuda.is_available():
         info["gpu_count"] = torch.cuda.device_count()
@@ -205,8 +233,9 @@ def edit_b64(req: EditRequest):
             image=img,
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
-            num_inference_steps=req.num_inference_steps,
+            num_inference_steps=req.num_inference_steps if req.num_inference_steps is not None else DEFAULT_STEPS,
             true_cfg_scale=req.true_cfg_scale,
+            lora_scale=req.lora_scale,
             seed=req.seed,
             width=req.width,
             height=req.height,
@@ -245,8 +274,9 @@ async def edit_multipart(
             image=img,
             prompt=prompt,
             negative_prompt=params.get("negative_prompt", " "),
-            num_inference_steps=int(params.get("num_inference_steps", 40)),
+            num_inference_steps=int(params.get("num_inference_steps", DEFAULT_STEPS)),
             true_cfg_scale=float(params.get("true_cfg_scale", 4.0)),
+            lora_scale=float(params.get("lora_scale", 1.0)),
             seed=params.get("seed"),
             width=params.get("width"),
             height=params.get("height"),
