@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Local model / wheels (these live on the GPU host, never in git)
+wheels/
+models/
+*.safetensors
+*.bin
+*.gguf
+
+# Logs and outputs
+logs/
+*.log
+tests/output/
+*.png
+*.jpg
+*.jpeg
+*.webp
+!tests/fixtures/**
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local secrets
+.env
+.env.local

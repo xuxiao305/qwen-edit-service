@@ -1,0 +1,16 @@
+{
+  "name": "@xuxiao305/qwen-edit-client",
+  "version": "0.2.0",
+  "description": "TypeScript HTTP client for QwenEditService (Qwen-Image-Edit-2511)",
+  "type": "module",
+  "main": "qwenEdit.ts",
+  "types": "qwenEdit.ts",
+  "files": ["qwenEdit.ts", "README.md"],
+  "license": "MIT",
+  "author": "xuxiao305",
+  "keywords": ["qwen", "image-edit", "diffusers", "client"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xuxiao305/qwen-edit-service.git"
+  }
+}
