@@ -142,18 +142,24 @@ def load_dual_gpu_pipeline(
     ).to(vae_device)
 
     # 3) transformer sharded across both GPUs. cuda:0 cap is reduced to leave
-    #    ~6 GiB free for text_encoder layer streaming + activations.
+    #    room for text_encoder layer streaming + activations. The remaining
+    #    ~5 GiB spills to CPU (re-streamed per layer once per step ≈ 0.3 s).
     transformer_mem = {
-        0: "16GiB",
+        0: "15GiB",
         1: f"{per_gpu_mem_gib}GiB",
+        "cpu": "48GiB",
     }
-    LOG.info("loading transformer (sharded) max_memory=%s ...", transformer_mem)
+    offload_folder = os.environ.get("QWEN_EDIT_OFFLOAD_DIR", "/tmp/qwen_edit_offload")
+    os.makedirs(offload_folder, exist_ok=True)
+    LOG.info("loading transformer (sharded) max_memory=%s offload_folder=%s ...",
+             transformer_mem, offload_folder)
     transformer = QwenImageTransformer2DModel.from_pretrained(
         model_path,
         subfolder="transformer",
         torch_dtype=dtype,
         device_map="auto",
         max_memory=transformer_mem,
+        offload_folder=offload_folder,
         low_cpu_mem_usage=True,
     )
     LOG.info("transformer params per device (B): %s",
