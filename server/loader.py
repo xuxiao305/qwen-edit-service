@@ -100,7 +100,7 @@ def load_dual_gpu_pipeline(
     LOG.info("pipeline class: %s", cls_name)
 
     text_encoder_exec_device = "cuda:0"
-    vae_device = "cuda:1"  # off cuda:0 to leave headroom for text_encoder streaming
+    vae_device = "cuda:0"  # must match execution_device for the pipeline's vae.encode
 
     t0 = time.time()
 
@@ -142,10 +142,11 @@ def load_dual_gpu_pipeline(
     ).to(vae_device)
 
     # 3) transformer sharded across both GPUs. cuda:0 cap is reduced to leave
-    #    room for text_encoder layer streaming + activations. The remaining
-    #    ~5 GiB spills to CPU (re-streamed per layer once per step ≈ 0.3 s).
+    #    room for vae (~1 GiB) + text_encoder layer streaming (~2 GiB) +
+    #    activations (~3 GiB). The remaining transformer weights spill to CPU
+    #    (re-streamed per layer once per step ≈ 0.3 s).
     transformer_mem = {
-        0: "15GiB",
+        0: "13GiB",
         1: f"{per_gpu_mem_gib}GiB",
         "cpu": "48GiB",
     }
