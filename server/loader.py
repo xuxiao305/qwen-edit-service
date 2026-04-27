@@ -105,14 +105,17 @@ def load_dual_gpu_pipeline(
 
     # 1) text_encoder loaded fully to CPU, then wrapped so accelerate
     #    streams it to GPU on demand for each forward call.
-    LOG.info("loading text_encoder to CPU (will stream to %s on forward) ...",
+    LOG.info("loading text_encoder fully to CPU RAM (will stream to %s on forward) ...",
              text_encoder_exec_device)
+    # NOTE: do NOT pass low_cpu_mem_usage=True or device_map here -- accelerate.cpu_offload
+    # requires real (non-meta) weights to install its pre/post-forward hooks. Otherwise
+    # the first forward fails with: NotImplementedError: Cannot copy out of meta tensor.
     text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_path,
         subfolder="text_encoder",
         torch_dtype=dtype,
-        low_cpu_mem_usage=True,
     )
+    text_encoder = text_encoder.to("cpu").eval()
     text_encoder = cpu_offload(text_encoder, execution_device=text_encoder_exec_device)
     LOG.info("text_encoder wrapped with accelerate.cpu_offload")
 
