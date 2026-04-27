@@ -1,21 +1,23 @@
-"""Dual-GPU loader for Qwen-Image-Edit-2511.
+"""Dual-GPU loader for Qwen-Image-Edit-2511 (component-level sharding).
 
-Strategy
---------
-The transformer is the only module that doesn't fit on a single 24 GB card,
-so we shard it across both GPUs with `device_map="balanced"` (this uses
-accelerate's `infer_auto_device_map` under the hood). The text encoder and
-VAE are tiny in comparison, so they're pinned to `cuda:0`.
+Why component-level loading?
+---------------------------
+diffusers' pipeline-level `from_pretrained(..., device_map="balanced")`
+treats whole sub-modules (transformer, text_encoder, vae) as atomic units
+and places each on a single device. On 2× A30 24GB this puts the entire
+~16 GB transformer on cuda:0 (alongside the 17 GB text_encoder if it
+fits, otherwise it spills to CPU) while cuda:1 sits empty. The result
+is effectively single-GPU inference with possible CPU offload.
 
-Why not `enable_*_cpu_offload`?
-  - `enable_model_cpu_offload`  — still requires the entire transformer to
-    fit on one card during forward (it doesn't, ~22 GB transformer + ~3 GB
-    activations on a 23.5 GiB card -> OOM).
-  - `enable_sequential_cpu_offload` — works but ~12 minutes per image due
-    to constant PCIe traffic.
-
-Two cards eliminate both problems at the cost of minor cross-GPU activation
-transfer (negligible vs PCIe-to-CPU offload).
+We instead:
+  1. Load the heavy `transformer` *separately* with `device_map="auto"`
+     so accelerate shards its layers across **both** GPUs.
+  2. Load the much-smaller `text_encoder` (Qwen2.5-VL, ~17 GB bf16) onto
+     cuda:1 — keeping it off cuda:0 leaves room there for the
+     transformer's first half + activations.
+  3. Load `vae` to cuda:0 (small).
+  4. Assemble the pipeline by passing components as kwargs, skipping
+     `from_pretrained`'s default placement.
 """
 
 from __future__ import annotations
@@ -32,11 +34,7 @@ LOG = logging.getLogger(__name__)
 
 
 def select_pipeline_class(model_path: str) -> tuple[Any, str]:
-    """Pick the diffusers pipeline class declared by `model_index.json`.
-
-    Newer (2509/2511) checkpoints use `QwenImageEditPlusPipeline`;
-    the original release uses `QwenImageEditPipeline`.
-    """
+    """Pick the diffusers pipeline class declared by `model_index.json`."""
     import diffusers
 
     idx_path = os.path.join(model_path, "model_index.json")
@@ -70,10 +68,16 @@ def load_dual_gpu_pipeline(
     per_gpu_mem_gib: int = 22,
     dtype: torch.dtype = torch.bfloat16,
 ):
-    """Load the Qwen-Image-Edit pipeline sharded across two GPUs.
+    """Load the Qwen-Image-Edit pipeline with components on different GPUs.
 
-    Returns the assembled diffusers pipeline (no `.to(device)` call needed —
-    components already live on their target devices).
+    Component placement:
+      - text_encoder: cuda:1 (~17 GB Qwen2.5-VL)
+      - transformer:  sharded across cuda:0 + cuda:1 via device_map="auto"
+      - vae:          cuda:0 (small)
+      - tokenizer/processor/scheduler: CPU (negligible)
+
+    cuda:1 holds text_encoder + roughly half of transformer.
+    cuda:0 holds vae + the other half of transformer + activations.
     """
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -83,34 +87,99 @@ def load_dual_gpu_pipeline(
             f"dual-GPU mode requires >= 2 CUDA devices, found {n_gpus}"
         )
 
+    from transformers import (
+        AutoTokenizer,
+        AutoProcessor,
+        Qwen2_5_VLForConditionalGeneration,
+    )
+    from diffusers import (
+        AutoencoderKLQwenImage,
+        FlowMatchEulerDiscreteScheduler,
+        QwenImageTransformer2DModel,
+    )
+
     cls, cls_name = select_pipeline_class(model_path)
     LOG.info("pipeline class: %s", cls_name)
 
-    # accelerate's max_memory dict expects per-device caps. Reserve room
-    # for activations and KV caches on each card.
-    max_memory = {i: f"{per_gpu_mem_gib}GiB" for i in range(n_gpus)}
-    LOG.info("dual-GPU loader: per_gpu_mem=%sGiB n_gpus=%d", per_gpu_mem_gib, n_gpus)
+    text_encoder_device = "cuda:1"
+    vae_device = "cuda:0"
 
     t0 = time.time()
-    # Load the heavy transformer with auto-balanced sharding across all GPUs.
-    pipe = cls.from_pretrained(
+
+    # 1) text_encoder first — pin it to cuda:1 so accelerate sees what's
+    #    occupied when it shards the transformer.
+    LOG.info("loading text_encoder on %s ...", text_encoder_device)
+    text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_path,
+        subfolder="text_encoder",
         torch_dtype=dtype,
-        device_map="balanced",
-        max_memory=max_memory,
+        low_cpu_mem_usage=True,
+    ).to(text_encoder_device)
+
+    # 2) vae onto cuda:0
+    LOG.info("loading vae on %s ...", vae_device)
+    vae = AutoencoderKLQwenImage.from_pretrained(
+        model_path,
+        subfolder="vae",
+        torch_dtype=dtype,
+    ).to(vae_device)
+
+    # 3) transformer with cross-GPU sharding. After step 1+2 cuda:0 has
+    #    vae (~1 GB) and cuda:1 has text_encoder (~17 GB), so we cap
+    #    transformer to leave headroom for activations + KV.
+    transformer_mem = {
+        0: f"{max(per_gpu_mem_gib - 2, 8)}GiB",  # vae small, lots of room
+        1: f"{max(per_gpu_mem_gib - 18, 3)}GiB",  # text_encoder takes most
+        "cpu": "64GiB",
+    }
+    LOG.info("loading transformer (sharded) max_memory=%s ...", transformer_mem)
+    transformer = QwenImageTransformer2DModel.from_pretrained(
+        model_path,
+        subfolder="transformer",
+        torch_dtype=dtype,
+        device_map="auto",
+        max_memory=transformer_mem,
         low_cpu_mem_usage=True,
     )
-    LOG.info("from_pretrained finished in %.1fs", time.time() - t0)
+    LOG.info("transformer params per device (B): %s",
+             _summarize_device_map(transformer))
 
-    # Activation memory savers (cheap, defensive).
-    for fn in ("enable_vae_tiling", "enable_attention_slicing"):
+    LOG.info("loading tokenizer / processor / scheduler ...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer")
+    processor = AutoProcessor.from_pretrained(model_path, subfolder="processor")
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        model_path, subfolder="scheduler"
+    )
+
+    LOG.info("assembling pipeline ...")
+    pipe = cls(
+        transformer=transformer,
+        text_encoder=text_encoder,
+        vae=vae,
+        tokenizer=tokenizer,
+        processor=processor,
+        scheduler=scheduler,
+    )
+    LOG.info("pipeline assembled in %.1fs total", time.time() - t0)
+
+    # Defensive activation savers (only enable if attribute exists).
+    for fn in ("enable_attention_slicing", "enable_vae_slicing", "enable_vae_tiling"):
         try:
             getattr(pipe, fn)()
             LOG.info("enabled: %s", fn)
-        except Exception as exc:  # pragma: no cover
-            LOG.warning("could not enable %s: %s", fn, exc)
+        except Exception:
+            pass
 
     return pipe, cls_name
+
+
+def _summarize_device_map(model: torch.nn.Module) -> dict[str, float]:
+    """Count parameters per device (in billions) for diagnostic logging."""
+    counts: dict[str, int] = {}
+    for p in model.parameters():
+        d = str(p.device)
+        counts[d] = counts.get(d, 0) + p.numel()
+    return {k: round(v / 1e9, 2) for k, v in counts.items()}
 
 
 def gpu_status() -> list[dict[str, Any]]:
