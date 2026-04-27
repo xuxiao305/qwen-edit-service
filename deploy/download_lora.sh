@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# Download LoRA weights for Qwen-Image-Edit-2511 to /project/qwen_edit/loras/
+# Download LoRA weights for Qwen-Image-Edit to /project/qwen_edit/loras/
 #
-# LoRAs downloaded:
-#   1. multiple-angles  fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA
-#      Trigger: <sks> [azimuth] [elevation] [distance]
-#      Example: "<sks> right side view eye-level shot medium shot"
-#      Size: 281 MB; recommended strength: 0.8-1.0
+# Files downloaded:
+#   For QwenEditService (diffusers, 2511 base):
+#     1. qwen-image-edit-2511-multiple-angles-lora.safetensors  (281 MB)
+#        Source: fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA
+#        Trigger: "<sks> right side view eye-level shot medium shot"
+#        Strength: 0.8-1.0
 #
-#   2. lightning-4step  lightx2v/Qwen-Image-Lightning
-#      File: Qwen-Image-Edit-Lightning-4steps-V1.0-bf16.safetensors
-#      Use with: num_inference_steps=4, true_cfg_scale=1.0
-#      Size: 850 MB
+#     2. Qwen-Image-Edit-Lightning-4steps-V1.0-bf16.safetensors  (850 MB)
+#        Source: lightx2v/Qwen-Image-Lightning
+#        Use: QWEN_EDIT_DEFAULT_STEPS=4  QWEN_EDIT_LORA_PATHS=...,<this>
+#
+#   For ComfyUI workflow (2509 base):
+#     3. Qwen-Edit-2509-Multiple-angles.safetensors  (~300 MB)
+#        Source: dx8152/Qwen-Edit-2509-Multiple-angles
 #
 # Usage:
 #   bash deploy/download_lora.sh
-#   HF_TOKEN=<your_token> bash deploy/download_lora.sh   # if rate-limited
+#   HF_TOKEN=<token> bash deploy/download_lora.sh   # if rate-limited
 set -eu
 
 LORA_DIR="${QWEN_EDIT_LORA_DIR:-/project/qwen_edit/loras}"
@@ -25,16 +29,22 @@ CONDA_SH="${CONDA_SH:-/data/miniconda3/etc/profile.d/conda.sh}"
 source "$CONDA_SH"
 conda activate qwen_edit
 
-HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0
+export HF_HUB_OFFLINE=0
+export TRANSFORMERS_OFFLINE=0
 
-echo "=== downloading multiple-angles LoRA (2511) ==="
+echo "=== [1/3] downloading multiple-angles LoRA (2511, for QwenEditService) ==="
 huggingface-cli download fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA \
   qwen-image-edit-2511-multiple-angles-lora.safetensors \
   --local-dir "$LORA_DIR"
 
-echo "=== downloading Lightning 4-step LoRA ==="
+echo "=== [2/3] downloading Lightning 4-step LoRA (for QwenEditService) ==="
 huggingface-cli download lightx2v/Qwen-Image-Lightning \
   Qwen-Image-Edit-Lightning-4steps-V1.0-bf16.safetensors \
+  --local-dir "$LORA_DIR"
+
+echo "=== [3/3] downloading multiple-angles LoRA (2509, for ComfyUI workflow) ==="
+huggingface-cli download dx8152/Qwen-Edit-2509-Multiple-angles \
+  Qwen-Edit-2509-Multiple-angles.safetensors \
   --local-dir "$LORA_DIR"
 
 echo ""
