@@ -39,6 +39,8 @@ conda activate qwen_edit
 
 export HF_HUB_OFFLINE=0
 export TRANSFORMERS_OFFLINE=0
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+echo "Using HF endpoint: $HF_ENDPOINT"
 
 echo "=== [1/3] UNet FP8 (20.4 GB) — qwen_image_edit_2509_fp8_e4m3fn.safetensors ==="
 # Source file is named with "_scaled" suffix; rename to match ComfyUI workflow

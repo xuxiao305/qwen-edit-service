@@ -31,6 +31,8 @@ conda activate qwen_edit
 
 export HF_HUB_OFFLINE=0
 export TRANSFORMERS_OFFLINE=0
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+echo "Using HF endpoint: $HF_ENDPOINT"
 
 echo "=== [1/3] downloading multiple-angles LoRA (2511, for QwenEditService) ==="
 huggingface-cli download fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA \
