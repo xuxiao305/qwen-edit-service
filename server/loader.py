@@ -83,7 +83,8 @@ def load_dual_gpu_pipeline(
             f"dual-GPU mode requires >= 2 CUDA devices, found {n_gpus}"
         )
 
-    from accelerate import cpu_offload
+    from accelerate import dispatch_model
+    from accelerate.utils import infer_auto_device_map
     from transformers import (
         AutoTokenizer,
         Qwen2_5_VLForConditionalGeneration,
@@ -99,27 +100,40 @@ def load_dual_gpu_pipeline(
     LOG.info("pipeline class: %s", cls_name)
 
     text_encoder_exec_device = "cuda:0"
-    vae_device = "cuda:0"
+    vae_device = "cuda:1"  # off cuda:0 to leave headroom for text_encoder streaming
 
     t0 = time.time()
 
-    # 1) text_encoder loaded fully to CPU, then wrapped so accelerate
-    #    streams it to GPU on demand for each forward call.
-    LOG.info("loading text_encoder fully to CPU RAM (will stream to %s on forward) ...",
-             text_encoder_exec_device)
-    # NOTE: do NOT pass low_cpu_mem_usage=True or device_map here -- accelerate.cpu_offload
-    # requires real (non-meta) weights to install its pre/post-forward hooks. Otherwise
-    # the first forward fails with: NotImplementedError: Cannot copy out of meta tensor.
+    # 1) text_encoder: load to CPU then dispatch with PER-LAYER offloading.
+    #    Whole-model `cpu_offload(...)` would try to pull all ~14 GB onto
+    #    execution_device at every forward and OOMs because the transformer
+    #    leaves <1 GB free on cuda:0. dispatch_model with a tight max_memory
+    #    keeps only ~2 GiB resident at a time and streams the rest from CPU.
+    LOG.info("loading text_encoder fully to CPU RAM ...")
     text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_path,
         subfolder="text_encoder",
         torch_dtype=dtype,
+    ).eval()
+    te_max_memory = {0: "2GiB", "cpu": "64GiB"}
+    te_no_split = getattr(text_encoder, "_no_split_modules", None) or []
+    te_device_map = infer_auto_device_map(
+        text_encoder,
+        max_memory=te_max_memory,
+        no_split_module_classes=te_no_split,
+        dtype=dtype,
     )
-    text_encoder = text_encoder.to("cpu").eval()
-    text_encoder = cpu_offload(text_encoder, execution_device=text_encoder_exec_device)
-    LOG.info("text_encoder wrapped with accelerate.cpu_offload")
+    on_gpu = sum(1 for v in te_device_map.values() if v != "cpu")
+    on_cpu = sum(1 for v in te_device_map.values() if v == "cpu")
+    LOG.info("text_encoder dispatch: %d submodules on GPU, %d on CPU (max %s GPU resident)",
+             on_gpu, on_cpu, te_max_memory[0])
+    text_encoder = dispatch_model(
+        text_encoder,
+        device_map=te_device_map,
+        main_device=text_encoder_exec_device,
+    )
 
-    # 2) vae to cuda:0
+    # 2) vae on cuda:1 (small, keeps cuda:0 headroom free)
     LOG.info("loading vae on %s ...", vae_device)
     vae = AutoencoderKLQwenImage.from_pretrained(
         model_path,
@@ -127,9 +141,10 @@ def load_dual_gpu_pipeline(
         torch_dtype=dtype,
     ).to(vae_device)
 
-    # 3) transformer sharded across BOTH GPUs at full per-card capacity.
+    # 3) transformer sharded across both GPUs. cuda:0 cap is reduced to leave
+    #    ~6 GiB free for text_encoder layer streaming + activations.
     transformer_mem = {
-        0: f"{per_gpu_mem_gib}GiB",
+        0: "16GiB",
         1: f"{per_gpu_mem_gib}GiB",
     }
     LOG.info("loading transformer (sharded) max_memory=%s ...", transformer_mem)
